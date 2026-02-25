@@ -17,7 +17,7 @@ OpenMP is detected automatically — if found, multi-threaded GEMM is enabled.
 
 ### 2. Download Weights
 
-Download the weights and place them in `./weights/`
+Download the weights from [here](https://github.com/divamgupta/cpp-convnet/releases/download/weights/resnet101_int8_cpp.bin) and place them in `./weights/`
 
 You should have `weights/resnet101_int8_cpp.bin`  
 
