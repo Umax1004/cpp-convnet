@@ -67,6 +67,15 @@ public:
     float  in_scale() const { return in_scale_; }
     int8_t in_zp()    const { return in_zp_; }
 
+    // Ternary mode flag (set by benchmark to compare int8 vs ternary)
+    static bool use_ternary_mode;
+    void set_ternary_mode(bool v) { use_ternary_mode = v; }
+
+    // Kernel selection: true = AVX2 (no VNNI), false = AVX512 (VNNI)
+    // Defaults to AVX2 so the comparison against the ternary kernel is fair.
+    static bool use_avx2_mode;
+    void set_avx2_mode(bool v) { use_avx2_mode = v; }
+
 private:
     std::vector<Layer>  layers_;
 

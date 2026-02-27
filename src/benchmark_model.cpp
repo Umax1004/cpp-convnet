@@ -14,7 +14,12 @@
 #include "stb_image_resize2.h"
 
 #include "model.hpp"
+#if defined(__aarch64__) || defined(__arm64__)
 #include "ops_neon.hpp"
+#else
+#include "ops_avx512.hpp"
+#include "ops_avx2.hpp"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -113,12 +118,14 @@ static int argmax(const std::vector<float>& v)
 // ──────────────────────────────────────────────
 int main(int argc, char** argv)
 {
-    std::string weights_path = "weights/resnet101_int8_cpp.bin";
+    std::string weights_path = "weights/resnet101_ternary.bin";
     std::string data_dir     = "test_data_mini";
     int warmup_runs = 3;
     int bench_runs  = 0;   // 0 = all images
     int num_threads = 8;   // optimal for bandwidth-limited workload (default)
     bool verbose    = false;
+    bool use_ternary = false;
+    bool use_avx2    = true;   // default: AVX2 (no VNNI) for fair comparison
 
     for (int a = 1; a < argc; ++a) {
         if (!strcmp(argv[a], "--weights") && a+1 < argc) weights_path = argv[++a];
@@ -127,7 +134,17 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[a], "--runs")    && a+1 < argc) bench_runs = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--threads") && a+1 < argc) num_threads = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--verbose"))                verbose = true;
+        else if (!strcmp(argv[a], "--ternary"))               use_ternary = true;
+        else if (!strcmp(argv[a], "--avx512"))               use_avx2 = false;
+        else if (!strcmp(argv[a], "--mode") && a+1 < argc) {
+            if (!strcmp(argv[++a], "ternary")) use_ternary = true;
+            else if (!strcmp(argv[a], "int8")) use_ternary = false;
+        }
     }
+
+    printf("Mode: %s | Kernel: %s\n",
+           use_ternary ? "Ternary (weights in {-1,0,1})" : "INT8",
+           use_avx2    ? "AVX2 (no VNNI)"                : "AVX512 (VNNI)");
 
 #ifdef _OPENMP
     omp_set_num_threads(num_threads);
@@ -136,6 +153,8 @@ int main(int argc, char** argv)
 
     // ── Load model ──────────────────────────────
     Resnet101Int8 model(weights_path);
+    model.set_ternary_mode(use_ternary);
+    model.set_avx2_mode(use_avx2);
 
     float  in_scale = model.in_scale();
     int8_t in_zp    = model.in_zp();
@@ -167,6 +186,7 @@ int main(int argc, char** argv)
     }
 
     ops_profile_reset();
+    ops_avx2_profile_reset();
 
     // ── Benchmark + Accuracy ─────────────────────
     int total = 0, correct = 0;
@@ -246,7 +266,10 @@ int main(int argc, char** argv)
     printf("  P99 latency      : %.2f ms\n", p99);
     printf("========================================\n");
 
-    ops_profile_print(total);
+    if (use_avx2)
+        ops_avx2_profile_print(total);
+    else
+        ops_profile_print(total);
 
     return 0;
 }

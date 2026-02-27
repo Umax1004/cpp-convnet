@@ -1,10 +1,19 @@
 #include "model.hpp"
+#if defined(__aarch64__) || defined(__arm64__)
 #include "ops_neon.hpp"
+#else
+#include "ops_avx512.hpp"
+#include "ops_avx2.hpp"
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cassert>
 #include <stdexcept>
 #include <utility>
+
+// Static member definitions
+bool Resnet101Int8::use_ternary_mode = false;
+bool Resnet101Int8::use_avx2_mode    = true;   // default: AVX2 (no VNNI) for fair comparison
 
 // ──────────────────────────────────────────────────────────────
 // Binary loader
@@ -165,17 +174,47 @@ static void run_conv(const Layer& L,
                      int8_t* out_buf,
                      int8_t* scratch_col)
 {
+#if defined(__aarch64__) || defined(__arm64__)
+    // ARM: single path, ternary flag selects kernel
     const int8_t* pre_packed = (L.groups == 1) ? L.w_packed.get() : nullptr;
-    conv2d_int8(
-        in_buf, L.weight.data(), pre_packed,
-        L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
-        out_buf,
-        C_in, H, W,
-        L.C_out, L.kH, L.kW,
-        L.stride_h, L.stride_w,
-        L.pad_h, L.pad_w,
-        L.groups,
-        scratch_col);
+    if (Resnet101Int8::use_ternary_mode)
+        conv2d_ternary(in_buf, L.weight.data(), pre_packed,
+                       L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                       out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                       L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+    else
+        conv2d_int8(in_buf, L.weight.data(), pre_packed,
+                    L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                    out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                    L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+#else
+    if (Resnet101Int8::use_avx2_mode) {
+        // AVX2: no VNNI, no w_pre_packed (always repacks in Co8×K4×32 layout)
+        if (Resnet101Int8::use_ternary_mode)
+            conv2d_ternary_avx2(in_buf, L.weight.data(),
+                                L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                                out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                                L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+        else
+            conv2d_int8_avx2(in_buf, L.weight.data(),
+                             L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                             out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                             L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+    } else {
+        // AVX512: VNNI, uses pre-packed sdot weights
+        const int8_t* pre_packed = (L.groups == 1) ? L.w_packed.get() : nullptr;
+        if (Resnet101Int8::use_ternary_mode)
+            conv2d_ternary(in_buf, L.weight.data(), pre_packed,
+                           L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                           out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                           L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+        else
+            conv2d_int8(in_buf, L.weight.data(), pre_packed,
+                        L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
+                        out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
+                        L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+    }
+#endif
 }
 
 
@@ -326,16 +365,33 @@ std::vector<float> Resnet101Int8::forward(const int8_t* input)
             }
 
         } else if (L.type == LAYER_GEMM) {
-            // FC layer: input is [cur_C] (after avgpool, spatial=1x1).
-            // Use pre-packed weights (L.w_packed, packed at load time) directly
-            // to avoid re-packing 2 MB of weights on every forward pass.
             logits.resize(L.C_out);
-            gemm_int8_neon(
-                buf_a, L.w_packed.get(),
-                L.eff_bias.data(), L.req_scale.data(), 0,
-                logits.data(), /*is_float=*/true,
-                /*M=*/1, /*K=*/L.C_in, /*N=*/L.C_out,
-                /*nchw_out=*/false);
+#if defined(__aarch64__) || defined(__arm64__)
+            gemm_int8_neon(buf_a, L.w_packed.get(),
+                           L.eff_bias.data(), L.req_scale.data(), 0,
+                           logits.data(), /*is_float=*/true,
+                           /*M=*/1, /*K=*/L.C_in, /*N=*/L.C_out,
+                           /*nchw_out=*/false);
+#else
+            if (Resnet101Int8::use_avx2_mode) {
+                // AVX2 path: repack into Co8×K4×32 layout on the fly.
+                // FC layer is tiny (1×2048×1000) so this cost is negligible.
+                int8_t* wb = pack_weights_avx2(L.weight.data(), L.C_out, L.C_in);
+                gemm_int8_avx2(buf_a, wb,
+                               L.eff_bias.data(), L.req_scale.data(), 0,
+                               logits.data(), /*is_float=*/true,
+                               /*M=*/1, /*K=*/L.C_in, /*N=*/L.C_out,
+                               /*nchw_out=*/false);
+                free_packed_avx2(wb);
+            } else {
+                // AVX512 path: use pre-packed sdot weights (loaded at startup).
+                gemm_int8_avx512(buf_a, L.w_packed.get(),
+                                 L.eff_bias.data(), L.req_scale.data(), 0,
+                                 logits.data(), /*is_float=*/true,
+                                 /*M=*/1, /*K=*/L.C_in, /*N=*/L.C_out,
+                                 /*nchw_out=*/false);
+            }
+#endif
             ++i;
 
         } else if (L.type == LAYER_MAXPOOL) {
