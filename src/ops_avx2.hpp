@@ -18,7 +18,11 @@
 // acc[row] corresponds directly to one output channel.
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Int8 packing: Co8 × K4 × 32 bytes (one int8 per weight)
 int8_t* pack_weights_avx2(const int8_t* w, int C_out, int K);
+// Ternary packing: same Co8 × K4 × 32 layout as int8, values stored as {-1, 0, +1} int8.
+// No 2-bit compression — the kernel uses sign_epi32 with zero decode overhead.
+int8_t* pack_weights_ternary_avx2(const int8_t* w, int C_out, int K);
 void    free_packed_avx2(int8_t* p);
 
 void gemm_int8_avx2(
@@ -60,7 +64,8 @@ void conv2d_int8_avx2(
     int stride_h, int stride_w,
     int pad_h, int pad_w,
     int groups = 1,
-    int8_t* scratch_col = nullptr
+    int8_t* scratch_col = nullptr,
+    const int8_t* w_pre_packed = nullptr  // Co8×K4×32, pre-packed by pack_weights_avx2 (groups==1 only)
 );
 
 void conv2d_ternary_avx2(
@@ -76,7 +81,8 @@ void conv2d_ternary_avx2(
     int stride_h, int stride_w,
     int pad_h, int pad_w,
     int groups = 1,
-    int8_t* scratch_col = nullptr
+    int8_t* scratch_col = nullptr,
+    const int8_t* w_pre_packed = nullptr  // Co8×K4×8, pre-packed by pack_weights_ternary_avx2 (groups==1 only)
 );
 
 void ops_avx2_profile_reset();

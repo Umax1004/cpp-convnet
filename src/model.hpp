@@ -35,8 +35,12 @@ struct Layer {
     std::vector<int64_t> eff_bias;      // [C_out]
 
     // Packed weights for SDOT (filled at load time for 1×1 / 3×3 convs)
-    std::shared_ptr<int8_t> w_packed;   // allocated with new[]
-    int K = 0;                          // kH*kW*C_in (inner GEMM dim)
+    std::shared_ptr<int8_t> w_packed;              // allocated with new[]
+    int K = 0;                                     // kH*kW*C_in (inner GEMM dim)
+
+    // AVX2 pre-packed ternary weights (x86 only, packed once at load time)
+    // Int8 weights are repacked on the fly from the raw int8 tensor.
+    std::shared_ptr<int8_t> w_packed_avx2_ternary; // Co8×K4×8, ternary
 
     // Add fields
     float in1_scale, in2_scale, out_scale;

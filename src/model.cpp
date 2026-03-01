@@ -95,6 +95,15 @@ Resnet101Int8::Resnet101Int8(const std::string& weights_path)
             int8_t* packed = pack_weights_sdot(L.weight.data(), L.C_out, L.K);
             L.w_packed = std::shared_ptr<int8_t>(packed, [](int8_t* p){ delete[] p; });
 
+#if !defined(__aarch64__) && !defined(__arm64__)
+            // Pre-pack ternary weights once at load time.
+            // Int8 weights use the raw tensor and are repacked on-the-fly inside conv2d_int8_avx2.
+            {
+                int8_t* p_tern = pack_weights_ternary_avx2(L.weight.data(), L.C_out, L.K);
+                L.w_packed_avx2_ternary = std::shared_ptr<int8_t>(p_tern, [](int8_t* p){ delete[] p; });
+            }
+#endif
+
         } else if (L.type == LAYER_ADD) {
             float scales[3];
             read_or_die(f, scales, 12, "add_scales");
@@ -189,17 +198,21 @@ static void run_conv(const Layer& L,
                     L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
 #else
     if (Resnet101Int8::use_avx2_mode) {
-        // AVX2: no VNNI, no w_pre_packed (always repacks in Co8×K4×32 layout)
-        if (Resnet101Int8::use_ternary_mode)
+        // Ternary: use pre-packed weights (packed once at load time, groups==1 only).
+        // Int8: repacks on-the-fly from the raw int8 tensor (pass nullptr).
+        if (Resnet101Int8::use_ternary_mode) {
+            const int8_t* pre_packed = (L.groups == 1) ? L.w_packed_avx2_ternary.get() : nullptr;
             conv2d_ternary_avx2(in_buf, L.weight.data(),
                                 L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
                                 out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
-                                L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
-        else
+                                L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col,
+                                pre_packed);
+        } else {
             conv2d_int8_avx2(in_buf, L.weight.data(),
                              L.eff_bias.data(), L.req_scale.data(), L.in_zp, L.out_zp,
                              out_buf, C_in, H, W, L.C_out, L.kH, L.kW,
                              L.stride_h, L.stride_w, L.pad_h, L.pad_w, L.groups, scratch_col);
+        }
     } else {
         // AVX512: VNNI, uses pre-packed sdot weights
         const int8_t* pre_packed = (L.groups == 1) ? L.w_packed.get() : nullptr;
@@ -374,8 +387,7 @@ std::vector<float> Resnet101Int8::forward(const int8_t* input)
                            /*nchw_out=*/false);
 #else
             if (Resnet101Int8::use_avx2_mode) {
-                // AVX2 path: repack into Co8×K4×32 layout on the fly.
-                // FC layer is tiny (1×2048×1000) so this cost is negligible.
+                // AVX2 path: repack FC weights on-the-fly (tiny 1×2048×1000, negligible cost).
                 int8_t* wb = pack_weights_avx2(L.weight.data(), L.C_out, L.C_in);
                 gemm_int8_avx2(buf_a, wb,
                                L.eff_bias.data(), L.req_scale.data(), 0,

@@ -14,6 +14,11 @@ else()
     message(STATUS "x86_64 detected — enabling AVX-512 VNNI")
     set(ARCH_FLAGS "-march=native -O3 -ffast-math -mavx512f -mavx512bw -mavx512vl -mavx512vnni")
     set(SIMD_SRC "src/ops_avx512.cpp" "src/ops_avx2.cpp")
+    # ops_avx2.cpp must NOT use AVX-512: prevents ZMM register spills that
+    # occur when -march=native generates ZMM code for the 8-acc inner loops.
+    set_source_files_properties(src/ops_avx2.cpp PROPERTIES
+        COMPILE_FLAGS "-mno-avx512f -mno-avx512bw -mno-avx512vl -mno-avx512vnni"
+    )
 endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ARCH_FLAGS}")

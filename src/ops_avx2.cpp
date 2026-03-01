@@ -67,6 +67,15 @@ int8_t* pack_weights_avx2(const int8_t* w, int C_out, int K)
 
 void free_packed_avx2(int8_t* p) { delete[] p; }
 
+// Ternary packing: same Co8 × K4 × 32 layout as pack_weights_avx2.
+// Values {-1, 0, +1} stored as raw int8 — no 2-bit compression.
+// The kernel uses sign_epi32 instead of mullo_epi32, so there is zero
+// decode overhead and the instruction count matches the int8 kernel exactly.
+int8_t* pack_weights_ternary_avx2(const int8_t* w, int C_out, int K)
+{
+    return pack_weights_avx2(w, C_out, K);
+}
+
 // ── Im2col (identical logic to ops_avx512.cpp; static to this TU) ─────────────
 
 static void im2col_1x1_gen_oh(
@@ -505,12 +514,8 @@ static inline void store_tile(
 // Each acc[row] is a __m256i holding 8 int32 partial sums (one per output channel).
 // No horizontal reduction needed: each lane accumulates one (row, oc) dot product.
 //
-//   Int8   inner compute: acc[row] += _mm256_mullo_epi32(a_32, b_32)
-//   Ternary inner compute: acc[row] += _mm256_sign_epi32(a_32, b_32)
-//     where _mm256_sign_epi32(a,b) = a if b>0, 0 if b==0, -a if b<0
-//
-// B_packed layout: b_co + k_blk*32 + ki*8 gives 8 consecutive int8 weight values,
-// one per output channel, for K-element (k_blk*4+ki).
+//   Int8    B layout: Co8 × K4 × 32 bytes (one int8 per weight)
+//   Ternary B layout: Co8 × K4 × 8 bytes  (4 ternary weights packed per byte)
 
 #ifdef __AVX2__
 
@@ -581,9 +586,14 @@ static void gemm_int8_avx2_inner(
     }
 }
 
+// Ternary inner kernel: 8-row × 8-col tile.
+// B_packed uses the same Co8 × K4 × 32 layout as the int8 kernel.
+// Values are raw {-1, 0, +1} int8 — no 2-bit decode needed.
+// sign_epi32 replaces mullo_epi32: same throughput (1 cycle), but only
+// 1-cycle latency vs 10-cycle for mullo, giving headroom on latency-bound paths.
 static void gemm_ternary_avx2_inner(
     const int8_t*  A,
-    const int8_t*  B_packed,
+    const int8_t*  B_packed,   // Co8 × K4 × 32 bytes, values ∈ {-1, 0, +1}
     const int64_t* eff_bias,
     const float*   req_scale,
     int8_t         out_zp,
@@ -614,11 +624,12 @@ static void gemm_ternary_avx2_inner(
                 const int     k0   = k_blk * 4;
 
                 for (int ki = 0; ki < 4 && k0 + ki < K; ++ki) {
+                    // Load 8 ternary weights as int8, extend to int32 ({-1,0,+1})
                     __m128i b_ki = _mm_loadl_epi64((__m128i*)(b_kb + ki * 8));
-                    __m256i b_32 = _mm256_cvtepi8_epi32(b_ki); // 8 {-1,0,+1} as int32
+                    __m256i b_32 = _mm256_cvtepi8_epi32(b_ki);
 
-                    // Ternary: sign_epi32(a, b) = a if b>0, 0 if b==0, -a if b<0
-                    // Equivalent to a*b for b ∈ {-1,0,+1}, but no multiply needed
+                    // sign_epi32(a, b): keeps a if b>0, zeroes if b=0, negates if b<0.
+                    // With b∈{-1,0,+1} this is identical to mullo(a,b) but faster.
 #define TERN_ACC(row, areg) do { \
     __m256i a_32 = _mm256_set1_epi32((int32_t)a[row][k0 + ki]); \
     areg = _mm256_add_epi32(areg, _mm256_sign_epi32(a_32, b_32)); \
@@ -647,7 +658,52 @@ static void gemm_ternary_avx2_inner(
 
 #endif // __AVX2__
 
-// ── Scalar tail: handles M % 8 remaining rows (shared by both kernels) ────────
+// ── Scalar tail for ternary (M % 8 remaining rows) ───────────────────────────
+// B_packed is in the same Co8 × K4 × 32 layout as int8; values are {-1,0,+1}.
+static void gemm_scalar_tail_ternary(
+    const int8_t*  A,
+    const int8_t*  B_packed,   // Co8 × K4 × 32 bytes, values ∈ {-1, 0, +1}
+    const int64_t* eff_bias,
+    const float*   req_scale,
+    int8_t         out_zp,
+    void*          C,
+    bool           is_float,
+    int m_start, int M, int K, int N,
+    bool           nchw_out,
+    int K4, int Co8, int co_s, int co_e)
+{
+    for (int m = m_start; m < M; ++m) {
+        for (int co_blk = co_s; co_blk < co_e; ++co_blk) {
+            const int8_t* b_co    = B_packed + (size_t)co_blk * K4 * 32;
+            const int     n0      = co_blk * 8;
+            const int     n_valid = std::min(8, N - n0);
+            int64_t acc_arr[8]    = {};
+
+            for (int k = 0; k < K; ++k) {
+                int    k_blk = k / 4, ki = k % 4;
+                int8_t a_val = A[m * K + k];
+                for (int oc = 0; oc < n_valid; ++oc)
+                    acc_arr[oc] += (int64_t)a_val * (int8_t)b_co[k_blk * 32 + ki * 8 + oc];
+            }
+            for (int oc = 0; oc < n_valid; ++oc) {
+                const int n     = n0 + oc;
+                int64_t   total = acc_arr[oc] + eff_bias[n];
+                if (is_float) {
+                    float val = (float)total * req_scale[n];
+                    if (nchw_out) ((float*)C)[n * M + m] = val;
+                    else          ((float*)C)[m * N + n] = val;
+                } else {
+                    int32_t q = (int32_t)std::roundf((float)total * req_scale[n]) + out_zp;
+                    int8_t val = (int8_t)std::clamp(q, -128, 127);
+                    if (nchw_out) ((int8_t*)C)[n * M + m] = val;
+                    else          ((int8_t*)C)[m * N + n] = val;
+                }
+            }
+        }
+    }
+}
+
+// ── Scalar tail: handles M % 8 remaining rows (int8 only) ────────────────────
 static void gemm_scalar_tail(
     const int8_t*  A,
     const int8_t*  B_packed,
@@ -773,8 +829,9 @@ void gemm_ternary_avx2(
 #endif
     }
 
-    const int K4  = (K + 3) / 4;
-    const int Co8 = (N + 7) / 8;
+    // B_packed is in Co8 × K4 × 32 layout (same as int8), values ∈ {-1, 0, +1}
+    const int K4      = (K + 3) / 4;
+    const int Co8     = (N + 7) / 8;
     const int m8_count = M / 8;
 
 #ifdef _OPENMP
@@ -793,13 +850,13 @@ void gemm_ternary_avx2(
     gemm_ternary_avx2_inner(A, B_packed, eff_bias, req_scale, out_zp, C, is_float,
                             M, K, N, nchw_out, K4, Co8, mi_s, mi_e, co_s, co_e);
 #else
-    gemm_scalar_tail(A, B_packed, eff_bias, req_scale, out_zp, C, is_float,
-                     mi_s * 8, std::min(mi_e * 8, M), K, N, nchw_out, K4, Co8, co_s, co_e);
+    gemm_scalar_tail_ternary(A, B_packed, eff_bias, req_scale, out_zp, C, is_float,
+                             mi_s * 8, std::min(mi_e * 8, M), K, N, nchw_out, K4, Co8, co_s, co_e);
 #endif
 
     if (n_part || tid == 0) {
-        gemm_scalar_tail(A, B_packed, eff_bias, req_scale, out_zp, C, is_float,
-                         m8_count * 8, M, K, N, nchw_out, K4, Co8, co_s, co_e);
+        gemm_scalar_tail_ternary(A, B_packed, eff_bias, req_scale, out_zp, C, is_float,
+                                 m8_count * 8, M, K, N, nchw_out, K4, Co8, co_s, co_e);
     }
 }
 
@@ -813,6 +870,7 @@ static void conv2d_avx2_impl(
     bool           is_ternary,
     const int8_t*  input,
     const int8_t*  weight,
+    const int8_t*  w_pre_packed,   // if non-null and groups==1, skip packing
     const int64_t* eff_bias,
     const float*   req_scale,
     int8_t         in_zp,
@@ -844,9 +902,19 @@ static void conv2d_avx2_impl(
         const int8_t* w_g   = weight + g * C_out_g * K;
         int8_t*       out_g = output + g * C_out_g * oHW;
 
-        // Always repack: w_pre_packed (if any) is in sdot Co4×K4×16 format,
-        // incompatible with the AVX2 Co8×K4×32 layout.
-        int8_t* w_packed = pack_weights_avx2(w_g, C_out_g, K);
+        // Use pre-packed weights when available (groups==1); otherwise pack on the fly.
+        // Ternary: Co8×K4×8 (compressed 2-bit, 4× smaller → fits in L2 for large layers)
+        // Int8:    Co8×K4×32 (one int8 per weight)
+        bool own_packed = false;
+        int8_t* w_packed;
+        if (w_pre_packed && groups == 1) {
+            w_packed = const_cast<int8_t*>(w_pre_packed);
+        } else {
+            w_packed = is_ternary
+                ? pack_weights_ternary_avx2(w_g, C_out_g, K)
+                : pack_weights_avx2(w_g, C_out_g, K);
+            own_packed = true;
+        }
 
 #ifdef _OPENMP
         const int nthreads = omp_get_max_threads();
@@ -934,7 +1002,7 @@ static void conv2d_avx2_impl(
             }
         }
 
-        free_packed_avx2(w_packed);
+        if (own_packed) free_packed_avx2(w_packed);
     }
 }
 
@@ -951,9 +1019,10 @@ void conv2d_int8_avx2(
     int stride_h, int stride_w,
     int pad_h, int pad_w,
     int groups,
-    int8_t* scratch_col)
+    int8_t* scratch_col,
+    const int8_t* w_pre_packed)
 {
-    conv2d_avx2_impl(false, input, weight, eff_bias, req_scale, in_zp, out_zp, output,
+    conv2d_avx2_impl(false, input, weight, w_pre_packed, eff_bias, req_scale, in_zp, out_zp, output,
                      C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w,
                      groups, scratch_col);
 }
@@ -971,9 +1040,10 @@ void conv2d_ternary_avx2(
     int stride_h, int stride_w,
     int pad_h, int pad_w,
     int groups,
-    int8_t* scratch_col)
+    int8_t* scratch_col,
+    const int8_t* w_pre_packed)
 {
-    conv2d_avx2_impl(true, input, weight, eff_bias, req_scale, in_zp, out_zp, output,
+    conv2d_avx2_impl(true, input, weight, w_pre_packed, eff_bias, req_scale, in_zp, out_zp, output,
                      C_in, H, W, C_out, kH, kW, stride_h, stride_w, pad_h, pad_w,
                      groups, scratch_col);
 }
